@@ -19,6 +19,7 @@
     import CustomGUISettingMenu from './lib/Setting/Pages/CustomGUISettingMenu.svelte';
     import { checkCharOrder } from './ts/globalApi.svelte';
     import { ArrowUpIcon, GlobeIcon, PlusIcon } from 'lucide-svelte';
+    import HypaV3Progress from './lib/Others/HypaV3Progress.svelte';
 
   
     let didFirstSetup: boolean  = $derived(DBState.db?.didFirstSetup)
@@ -168,4 +169,5 @@
         <ListedPersona close={() => {$openPersonaList = false}} />
     {/if}
     <SavePopupIconComp />
+    <HypaV3Progress />
 </main>
