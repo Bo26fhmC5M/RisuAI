@@ -27,7 +27,10 @@
   } from "../../ts/stores.svelte";
   import { type OpenAIChat } from "../../ts/process/index.svelte";
   import { processScriptFull, risuChatParser } from "../../ts/process/scripts";
-  import { summarize } from "../../ts/process/memory/hypav3";
+  import {
+    summarize,
+    getCurrentHypaV3Preset,
+  } from "../../ts/process/memory/hypav3";
   import { type Message } from "../../ts/storage/database.svelte";
   import { translateHTML } from "../../ts/translator/translator";
   import { language } from "../../lang";
@@ -507,7 +510,7 @@
       return null;
     }
 
-    return DBState.db.hypaV3Settings.processRegexScript
+    return getCurrentHypaV3Preset().settings.processRegexScript
       ? await processRegexScript(unprocessed)
       : unprocessed;
   }
@@ -642,7 +645,7 @@
       return null;
     }
 
-    return DBState.db.hypaV3Settings.processRegexScript
+    return getCurrentHypaV3Preset().settings.processRegexScript
       ? await processRegexScript(unprocessed)
       : unprocessed;
   }

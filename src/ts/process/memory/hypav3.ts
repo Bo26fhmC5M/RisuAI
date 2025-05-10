@@ -1,4 +1,6 @@
 import { type memoryVector, HypaProcesser, similarity } from "./hypamemory";
+import { TaskRateLimiter } from "./taskRateLimiter";
+import { type EmbeddingText, HypaProcessorV2 } from "./hypamemoryv2";
 import {
   type Chat,
   type character,
@@ -9,6 +11,7 @@ import { type OpenAIChat } from "../index.svelte";
 import { requestChatData } from "../request";
 import { runSummarizer } from "../transformers";
 import { parseChatML } from "src/ts/parser.svelte";
+import { alertStore } from "src/ts/stores.svelte";
 import { type ChatTokenizer } from "src/ts/tokenizer";
 
 export interface HypaV3Preset {
@@ -28,6 +31,12 @@ export interface HypaV3Settings {
   preserveOrphanedMemory: boolean;
   processRegexScript: boolean;
   doNotSummarizeUserMessage: boolean;
+  // Experimental
+  useExperimentalImpl: boolean;
+  summarizationRequestsPerMinute: number;
+  summarizationMaxConcurrent: number;
+  embeddingRequestsPerMinute: number;
+  embeddingMaxConcurrent: number;
 }
 
 interface HypaV3Data {
@@ -76,6 +85,21 @@ export async function hypaMemoryV3(
   tokenizer: ChatTokenizer
 ): Promise<HypaV3Result> {
   try {
+    const settings = getCurrentHypaV3Preset().settings;
+
+    if (settings.useExperimentalImpl) {
+      console.log(logPrefix, "Using experimental implementation.");
+
+      return await hypaMemoryV3MainExp(
+        chats,
+        currentTokens,
+        maxContextTokens,
+        room,
+        char,
+        tokenizer
+      );
+    }
+
     return await hypaMemoryV3Main(
       chats,
       currentTokens,
@@ -102,6 +126,779 @@ export async function hypaMemoryV3(
 
     throw new Error(`${logPrefix} ${errorMessage}`);
   }
+}
+
+async function hypaMemoryV3MainExp(
+  chats: OpenAIChat[],
+  currentTokens: number,
+  maxContextTokens: number,
+  room: Chat,
+  char: character | groupChat,
+  tokenizer: ChatTokenizer
+): Promise<HypaV3Result> {
+  const db = getDatabase();
+  const settings = getCurrentHypaV3Preset().settings;
+
+  // Validate settings
+  if (settings.recentMemoryRatio + settings.similarMemoryRatio > 1) {
+    return {
+      currentTokens,
+      chats,
+      error: `${logPrefix} The sum of Recent Memory Ratio and Similar Memory Ratio is greater than 1.`,
+    };
+  }
+
+  // Initial token correction
+  currentTokens -= db.maxResponse;
+
+  // Load existing hypa data if available
+  let data: HypaV3Data = {
+    summaries: [],
+    lastSelectedSummaries: [],
+  };
+
+  if (room.hypaV3Data) {
+    data = toHypaV3Data(room.hypaV3Data);
+  }
+
+  // Clean orphaned summaries
+  if (!settings.preserveOrphanedMemory) {
+    cleanOrphanedSummary(chats, data);
+  }
+
+  // Determine starting index
+  let startIdx = 0;
+
+  if (data.summaries.length > 0) {
+    const lastSummary = data.summaries.at(-1);
+    const lastChatIndex = chats.findIndex(
+      (chat) => chat.memo === [...lastSummary.chatMemos].at(-1)
+    );
+
+    if (lastChatIndex !== -1) {
+      startIdx = lastChatIndex + 1;
+
+      // Exclude tokens from summarized chats
+      const summarizedChats = chats.slice(0, lastChatIndex + 1);
+      for (const chat of summarizedChats) {
+        currentTokens -= await tokenizer.tokenizeChat(chat);
+      }
+    }
+  }
+
+  console.log(logPrefix, "Starting index:", startIdx);
+
+  // Reserve memory tokens
+  const emptyMemoryTokens = await tokenizer.tokenizeChat({
+    role: "system",
+    content: wrapWithXml(memoryPromptTag, ""),
+  });
+  const memoryTokens = Math.floor(
+    maxContextTokens * settings.memoryTokensRatio
+  );
+  const shouldReserveEmptyMemoryTokens =
+    data.summaries.length === 0 &&
+    currentTokens + emptyMemoryTokens <= maxContextTokens;
+  let availableMemoryTokens = shouldReserveEmptyMemoryTokens
+    ? 0
+    : memoryTokens - emptyMemoryTokens;
+
+  if (shouldReserveEmptyMemoryTokens) {
+    currentTokens += emptyMemoryTokens;
+    console.log(logPrefix, "Reserved empty memory tokens:", emptyMemoryTokens);
+  } else {
+    currentTokens += memoryTokens;
+    console.log(logPrefix, "Reserved max memory tokens:", memoryTokens);
+  }
+
+  // If summarization is needed
+  const summarizationMode = currentTokens > maxContextTokens;
+  const targetTokens =
+    maxContextTokens * (1 - settings.extraSummarizationRatio);
+  const toSummarizeArray: OpenAIChat[][] = [];
+
+  while (summarizationMode) {
+    if (currentTokens <= targetTokens) {
+      break;
+    }
+
+    if (chats.length - startIdx <= minChatsForSimilarity) {
+      if (currentTokens <= maxContextTokens) {
+        break;
+      } else {
+        return {
+          currentTokens,
+          chats,
+          error: `${logPrefix} Cannot summarize further: input token count (${currentTokens}) exceeds max context size (${maxContextTokens}), but minimum ${minChatsForSimilarity} messages required.`,
+          memory: toSerializableHypaV3Data(data),
+        };
+      }
+    }
+
+    const toSummarize: OpenAIChat[] = [];
+    let toSummarizeTokens = 0;
+    let currentIndex = startIdx;
+
+    console.log(
+      logPrefix,
+      "Evaluating summarization batch:",
+      "\nCurrent Tokens:",
+      currentTokens,
+      "\nMax Context Tokens:",
+      maxContextTokens,
+      "\nStart Index:",
+      startIdx,
+      "\nMax Chats Per Summary:",
+      settings.maxChatsPerSummary
+    );
+
+    while (
+      toSummarize.length < settings.maxChatsPerSummary &&
+      currentIndex < chats.length - minChatsForSimilarity
+    ) {
+      const chat = chats[currentIndex];
+      const chatTokens = await tokenizer.tokenizeChat(chat);
+
+      console.log(
+        logPrefix,
+        "Evaluating chat:",
+        "\nIndex:",
+        currentIndex,
+        "\nRole:",
+        chat.role,
+        "\nContent:",
+        "\n" + chat.content,
+        "\nTokens:",
+        chatTokens
+      );
+
+      toSummarizeTokens += chatTokens;
+
+      let shouldSummarize = true;
+
+      if (
+        chat.name === "example_user" ||
+        chat.name === "example_assistant" ||
+        chat.memo === "NewChatExample"
+      ) {
+        console.log(
+          logPrefix,
+          `Skipping example chat at index ${currentIndex}`
+        );
+        shouldSummarize = false;
+      }
+
+      if (chat.memo === "NewChat") {
+        console.log(logPrefix, `Skipping new chat at index ${currentIndex}`);
+        shouldSummarize = false;
+      }
+
+      if (chat.content.trim().length === 0) {
+        console.log(logPrefix, `Skipping empty chat at index ${currentIndex}`);
+        shouldSummarize = false;
+      }
+
+      if (settings.doNotSummarizeUserMessage && chat.role === "user") {
+        console.log(logPrefix, `Skipping user role at index ${currentIndex}`);
+        shouldSummarize = false;
+      }
+
+      if (shouldSummarize) {
+        toSummarize.push(chat);
+      }
+
+      currentIndex++;
+    }
+
+    // Stop summarization if further reduction would go below target tokens (unless we're over max tokens)
+    if (
+      currentTokens <= maxContextTokens &&
+      currentTokens - toSummarizeTokens < targetTokens
+    ) {
+      console.log(
+        logPrefix,
+        "Stopping summarization:",
+        `\ncurrentTokens(${currentTokens}) - toSummarizeTokens(${toSummarizeTokens}) < targetTokens(${targetTokens})`
+      );
+      break;
+    }
+
+    // Collect summarization batch
+    if (toSummarize.length > 0) {
+      console.log(
+        logPrefix,
+        "Collecting summarization batch:",
+        "\nTarget:",
+        toSummarize
+      );
+
+      toSummarizeArray.push([...toSummarize]);
+    }
+
+    currentTokens -= toSummarizeTokens;
+    startIdx = currentIndex;
+  }
+
+  // Process all collected summarization tasks
+  if (toSummarizeArray.length > 0) {
+    // Initialize rate limiter
+    const rateLimiter = new TaskRateLimiter({
+      tasksPerMinute: settings.summarizationRequestsPerMinute,
+      maxConcurrentTasks: settings.summarizationMaxConcurrent,
+    });
+
+    const summarizationTasks = toSummarizeArray.map((item) => () => {
+      alertStore.set({
+        type: "progress2",
+        msg: `${logPrefix} Summarizing...`,
+        submsg: `${rateLimiter.queuedTaskCount} queued`,
+      });
+
+      return summarize(item);
+    });
+
+    // Start of performance measurement: summarize
+    console.log(
+      logPrefix,
+      `Starting ${toSummarizeArray.length} summarization.`
+    );
+    const summarizeStartTime = performance.now();
+
+    const batchResult = await rateLimiter.executeBatch<{
+      success: boolean;
+      data: string;
+    }>(summarizationTasks);
+
+    const summarizeEndTime = performance.now();
+    console.debug(
+      `${logPrefix} summarization completed in ${
+        summarizeEndTime - summarizeStartTime
+      }ms`
+    );
+    // End of performance measurement: summarize
+
+    alertStore.set({
+      type: "none",
+      msg: "",
+    });
+
+    // Note:
+    // We can't save some successful summaries to the DB temporarily
+    // because don't know the actual summarization model name.
+    // It is possible that the user can change the summarization model.
+    for (let i = 0; i < batchResult.results.length; i++) {
+      const result = batchResult.results[i];
+
+      // Push consecutive successes
+      if (!result.success || !result.data.success) {
+        console.log(
+          logPrefix,
+          "Summarization failed:",
+          `\n${!result.success ? result.error : result.data.data}`
+        );
+
+        return {
+          currentTokens,
+          chats,
+          error: `${logPrefix} Summarization failed: ${
+            !result.success ? result.error : result.data.data
+          }`,
+          memory: toSerializableHypaV3Data(data),
+        };
+      }
+
+      const summaryText = result.data.data;
+
+      data.summaries.push({
+        text: summaryText,
+        chatMemos: new Set(toSummarizeArray[i].map((chat) => chat.memo)),
+        isImportant: false,
+      });
+    }
+  }
+
+  console.log(
+    logPrefix,
+    `${summarizationMode ? "Completed" : "Skipped"} summarization phase:`,
+    "\nCurrent Tokens:",
+    currentTokens,
+    "\nMax Context Tokens:",
+    maxContextTokens,
+    "\nAvailable Memory Tokens:",
+    availableMemoryTokens
+  );
+
+  // Early return if no summaries
+  if (data.summaries.length === 0) {
+    // Generate final memory prompt
+    const memory = wrapWithXml(memoryPromptTag, "");
+
+    const newChats: OpenAIChat[] = [
+      {
+        role: "system",
+        content: memory,
+        memo: "supaMemory",
+      },
+      ...chats.slice(startIdx),
+    ];
+
+    console.log(
+      logPrefix,
+      "Exiting function:",
+      "\nCurrent Tokens:",
+      currentTokens,
+      "\nAll chats, including memory prompt:",
+      newChats,
+      "\nMemory Data:",
+      data
+    );
+
+    return {
+      currentTokens,
+      chats: newChats,
+      memory: toSerializableHypaV3Data(data),
+    };
+  }
+
+  const selectedSummaries: Summary[] = [];
+  const randomMemoryRatio =
+    1 - settings.recentMemoryRatio - settings.similarMemoryRatio;
+
+  // Select important summaries
+  {
+    const selectedImportantSummaries: Summary[] = [];
+
+    for (const summary of data.summaries) {
+      if (summary.isImportant) {
+        const summaryTokens = await tokenizer.tokenizeChat({
+          role: "system",
+          content: summary.text + summarySeparator,
+        });
+
+        if (summaryTokens > availableMemoryTokens) {
+          break;
+        }
+
+        selectedImportantSummaries.push(summary);
+
+        availableMemoryTokens -= summaryTokens;
+      }
+    }
+
+    selectedSummaries.push(...selectedImportantSummaries);
+
+    console.log(
+      logPrefix,
+      "After important memory selection:",
+      "\nSummary Count:",
+      selectedImportantSummaries.length,
+      "\nSummaries:",
+      selectedImportantSummaries,
+      "\nAvailable Memory Tokens:",
+      availableMemoryTokens
+    );
+  }
+
+  // Select recent summaries
+  const reservedRecentMemoryTokens = Math.floor(
+    availableMemoryTokens * settings.recentMemoryRatio
+  );
+  let consumedRecentMemoryTokens = 0;
+
+  if (settings.recentMemoryRatio > 0) {
+    const selectedRecentSummaries: Summary[] = [];
+
+    // Target only summaries that haven't been selected yet
+    const unusedSummaries = data.summaries.filter(
+      (e) => !selectedSummaries.includes(e)
+    );
+
+    // Add one by one from the end
+    for (let i = unusedSummaries.length - 1; i >= 0; i--) {
+      const summary = unusedSummaries[i];
+      const summaryTokens = await tokenizer.tokenizeChat({
+        role: "system",
+        content: summary.text + summarySeparator,
+      });
+
+      if (
+        summaryTokens + consumedRecentMemoryTokens >
+        reservedRecentMemoryTokens
+      ) {
+        break;
+      }
+
+      selectedRecentSummaries.push(summary);
+      consumedRecentMemoryTokens += summaryTokens;
+    }
+
+    selectedSummaries.push(...selectedRecentSummaries);
+
+    console.log(
+      logPrefix,
+      "After recent memory selection:",
+      "\nSummary Count:",
+      selectedRecentSummaries.length,
+      "\nSummaries:",
+      selectedRecentSummaries,
+      "\nReserved Tokens:",
+      reservedRecentMemoryTokens,
+      "\nConsumed Tokens:",
+      consumedRecentMemoryTokens
+    );
+  }
+
+  // Select similar summaries
+  let reservedSimilarMemoryTokens = Math.floor(
+    availableMemoryTokens * settings.similarMemoryRatio
+  );
+  let consumedSimilarMemoryTokens = 0;
+
+  if (settings.similarMemoryRatio > 0) {
+    const selectedSimilarSummaries: Summary[] = [];
+
+    // Utilize unused token space from recent selection
+    if (randomMemoryRatio <= 0) {
+      const unusedRecentTokens =
+        reservedRecentMemoryTokens - consumedRecentMemoryTokens;
+
+      reservedSimilarMemoryTokens += unusedRecentTokens;
+      console.log(
+        logPrefix,
+        "Additional available token space for similar memory:",
+        "\nFrom recent:",
+        unusedRecentTokens
+      );
+    }
+
+    // Target only summaries that haven't been selected yet
+    const unusedSummaries = data.summaries.filter(
+      (e) => !selectedSummaries.includes(e)
+    );
+
+    // Dynamically generate embedding texts
+    const ebdTexts: EmbeddingText<Summary>[] = unusedSummaries.flatMap(
+      (summary) => {
+        const splitted = summary.text
+          .split("\n\n")
+          .filter((e) => e.trim().length > 0);
+
+        return splitted.map((e) => ({
+          content: e.trim(),
+          metadata: summary,
+        }));
+      }
+    );
+
+    // Initialize embedding processor
+    const processor = new HypaProcessorV2<Summary>({
+      rateLimiter: new TaskRateLimiter({
+        tasksPerMinute: settings.embeddingRequestsPerMinute,
+        maxConcurrentTasks: settings.embeddingMaxConcurrent,
+      }),
+      onProgress: (queuedTaskCount) => {
+        alertStore.set({
+          type: "progress2",
+          msg: `${logPrefix} Similarity searching...`,
+          submsg: `${queuedTaskCount} queued`,
+        });
+      },
+    });
+
+    try {
+      // Start of performance measurement: addTexts
+      console.log(
+        `${logPrefix} Starting addTexts with ${ebdTexts.length} chunks`
+      );
+      const addStartTime = performance.now();
+
+      // Add EmbeddingTexts to processor for similarity search
+      await processor.addTexts(ebdTexts);
+
+      const addEndTime = performance.now();
+      console.debug(
+        `${logPrefix} addTexts completed in ${addEndTime - addStartTime}ms`
+      );
+      // End of performance measurement: addTexts
+    } catch (error) {
+      return {
+        currentTokens,
+        chats,
+        error: `${logPrefix} Similarity search failed: ${error}`,
+        memory: toSerializableHypaV3Data(data),
+      };
+    } finally {
+      alertStore.set({
+        type: "none",
+        msg: "",
+      });
+    }
+
+    const recentChats = chats
+      .slice(-minChatsForSimilarity)
+      .filter((chat) => chat.content.trim().length > 0);
+    const queries: string[] = recentChats.flatMap((chat) => {
+      return chat.content.split("\n\n").filter((e) => e.trim().length > 0);
+    });
+
+    if (queries.length > 0) {
+      const scoredSummaries = new Map<Summary, number>();
+
+      try {
+        // Start of performance measurement: similarity search
+        console.log(
+          `${logPrefix} Starting similarity search with ${recentChats.length} queries`
+        );
+        const searchStartTime = performance.now();
+
+        const batchScoredResults = await processor.similaritySearchScoredBatch(
+          queries
+        );
+
+        const searchEndTime = performance.now();
+        console.debug(
+          `${logPrefix} Similarity search completed in ${
+            searchEndTime - searchStartTime
+          }ms`
+        );
+        // End of performance measurement: similarity search
+
+        for (const scoredResults of batchScoredResults) {
+          for (const [ebdResult, similarity] of scoredResults) {
+            const summary = ebdResult.metadata;
+
+            scoredSummaries.set(
+              summary,
+              (scoredSummaries.get(summary) || 0) + similarity
+            );
+          }
+        }
+      } catch (error) {
+        return {
+          currentTokens,
+          chats,
+          error: `${logPrefix} Similarity search failed: ${error}`,
+          memory: toSerializableHypaV3Data(data),
+        };
+      } finally {
+        alertStore.set({
+          type: "none",
+          msg: "",
+        });
+      }
+
+      // Normalize scores
+      if (scoredSummaries.size > 0) {
+        const maxScore = Math.max(...scoredSummaries.values());
+
+        for (const [summary, score] of scoredSummaries.entries()) {
+          scoredSummaries.set(summary, score / maxScore);
+        }
+      }
+
+      // Sort in descending order
+      const scoredArray = [...scoredSummaries.entries()].sort(
+        ([, scoreA], [, scoreB]) => scoreB - scoreA
+      );
+
+      // Debug log for scoredArray
+      console.debug("scoredArray:", scoredArray);
+
+      while (scoredArray.length > 0) {
+        const [summary] = scoredArray.shift();
+        const summaryTokens = await tokenizer.tokenizeChat({
+          role: "system",
+          content: summary.text + summarySeparator,
+        });
+
+        /*
+        console.log(
+          logPrefix,
+          "Trying to add similar summary:",
+          "\nSummary Tokens:",
+          summaryTokens,
+          "\nConsumed Similar Memory Tokens:",
+          consumedSimilarMemoryTokens,
+          "\nReserved Tokens:",
+          reservedSimilarMemoryTokens,
+          "\nWould exceed:",
+          summaryTokens + consumedSimilarMemoryTokens >
+            reservedSimilarMemoryTokens
+        );
+        */
+
+        if (
+          summaryTokens + consumedSimilarMemoryTokens >
+          reservedSimilarMemoryTokens
+        ) {
+          console.log(
+            logPrefix,
+            "Stopping similar memory selection:",
+            `\nconsumedSimilarMemoryTokens(${consumedSimilarMemoryTokens}) + summaryTokens(${summaryTokens}) > reservedSimilarMemoryTokens(${reservedSimilarMemoryTokens})`
+          );
+          break;
+        }
+
+        selectedSimilarSummaries.push(summary);
+        consumedSimilarMemoryTokens += summaryTokens;
+      }
+
+      selectedSummaries.push(...selectedSimilarSummaries);
+    }
+
+    console.log(
+      logPrefix,
+      "After similar memory selection:",
+      "\nSummary Count:",
+      selectedSimilarSummaries.length,
+      "\nSummaries:",
+      selectedSimilarSummaries,
+      "\nReserved Tokens:",
+      reservedSimilarMemoryTokens,
+      "\nConsumed Tokens:",
+      consumedSimilarMemoryTokens
+    );
+  }
+
+  // Select random summaries
+  let reservedRandomMemoryTokens = Math.floor(
+    availableMemoryTokens * randomMemoryRatio
+  );
+  let consumedRandomMemoryTokens = 0;
+
+  if (randomMemoryRatio > 0) {
+    const selectedRandomSummaries: Summary[] = [];
+
+    // Utilize unused token space from recent and similar selection
+    const unusedRecentTokens =
+      reservedRecentMemoryTokens - consumedRecentMemoryTokens;
+    const unusedSimilarTokens =
+      reservedSimilarMemoryTokens - consumedSimilarMemoryTokens;
+
+    reservedRandomMemoryTokens += unusedRecentTokens + unusedSimilarTokens;
+    console.log(
+      logPrefix,
+      "Additional available token space for random memory:",
+      "\nFrom recent:",
+      unusedRecentTokens,
+      "\nFrom similar:",
+      unusedSimilarTokens,
+      "\nTotal added:",
+      unusedRecentTokens + unusedSimilarTokens
+    );
+
+    // Target only summaries that haven't been selected yet
+    const unusedSummaries = data.summaries
+      .filter((e) => !selectedSummaries.includes(e))
+      .sort(() => Math.random() - 0.5); // Random shuffle
+
+    for (const summary of unusedSummaries) {
+      const summaryTokens = await tokenizer.tokenizeChat({
+        role: "system",
+        content: summary.text + summarySeparator,
+      });
+
+      if (
+        summaryTokens + consumedRandomMemoryTokens >
+        reservedRandomMemoryTokens
+      ) {
+        // Trying to select more random memory
+        continue;
+      }
+
+      selectedRandomSummaries.push(summary);
+      consumedRandomMemoryTokens += summaryTokens;
+    }
+
+    selectedSummaries.push(...selectedRandomSummaries);
+
+    console.log(
+      logPrefix,
+      "After random memory selection:",
+      "\nSummary Count:",
+      selectedRandomSummaries.length,
+      "\nSummaries:",
+      selectedRandomSummaries,
+      "\nReserved Tokens:",
+      reservedRandomMemoryTokens,
+      "\nConsumed Tokens:",
+      consumedRandomMemoryTokens
+    );
+  }
+
+  // Sort selected summaries chronologically (by index)
+  selectedSummaries.sort(
+    (a, b) => data.summaries.indexOf(a) - data.summaries.indexOf(b)
+  );
+
+  // Generate final memory prompt
+  const memory = wrapWithXml(
+    memoryPromptTag,
+    selectedSummaries.map((e) => e.text).join(summarySeparator)
+  );
+  const realMemoryTokens = await tokenizer.tokenizeChat({
+    role: "system",
+    content: memory,
+  });
+
+  // Release reserved memory tokens
+  if (shouldReserveEmptyMemoryTokens) {
+    currentTokens -= emptyMemoryTokens;
+  } else {
+    currentTokens -= memoryTokens;
+  }
+
+  currentTokens += realMemoryTokens;
+
+  console.log(
+    logPrefix,
+    "Final memory selection:",
+    "\nSummary Count:",
+    selectedSummaries.length,
+    "\nSummaries:",
+    selectedSummaries,
+    "\nReal Memory Tokens:",
+    realMemoryTokens,
+    "\nAvailable Memory Tokens:",
+    availableMemoryTokens
+  );
+
+  if (currentTokens > maxContextTokens) {
+    throw new Error(
+      `Unexpected error: input token count (${currentTokens}) exceeds max context size (${maxContextTokens})`
+    );
+  }
+
+  // Save last selected summaries
+  data.lastSelectedSummaries = selectedSummaries.map((selectedSummary) =>
+    data.summaries.findIndex((summary) => summary === selectedSummary)
+  );
+
+  const newChats: OpenAIChat[] = [
+    {
+      role: "system",
+      content: memory,
+      memo: "supaMemory",
+    },
+    ...chats.slice(startIdx),
+  ];
+
+  console.log(
+    logPrefix,
+    "Exiting function:",
+    "\nCurrent Tokens:",
+    currentTokens,
+    "\nAll chats, including memory prompt:",
+    newChats,
+    "\nMemory Data:",
+    data
+  );
+
+  return {
+    currentTokens,
+    chats: newChats,
+    memory: toSerializableHypaV3Data(data),
+  };
 }
 
 async function hypaMemoryV3Main(
@@ -957,7 +1754,7 @@ export async function summarize(
   };
 }
 
-function getCurrentHypaV3Preset(): HypaV3Preset {
+export function getCurrentHypaV3Preset(): HypaV3Preset {
   const db = getDatabase();
   const preset = db.hypaV3Presets?.[db.hypaV3PresetId];
 
@@ -984,6 +1781,12 @@ export function createHypaV3Preset(
     preserveOrphanedMemory: false,
     processRegexScript: false,
     doNotSummarizeUserMessage: false,
+    // Experimental
+    useExperimentalImpl: false,
+    summarizationRequestsPerMinute: 20,
+    summarizationMaxConcurrent: 1,
+    embeddingRequestsPerMinute: 100,
+    embeddingMaxConcurrent: 1,
   };
 
   if (

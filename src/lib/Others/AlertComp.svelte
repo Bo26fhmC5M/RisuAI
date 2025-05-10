@@ -108,7 +108,7 @@
                 }}>Terms of Service</a> to continue</div>
             {:else if $alertStore.type !== 'select' && $alertStore.type !== 'requestdata' && $alertStore.type !== 'addchar' && $alertStore.type !== 'hypaV2' && $alertStore.type !== 'chatOptions'}
                 <span class="text-gray-300">{$alertStore.msg}</span>
-                {#if $alertStore.submsg && $alertStore.type !== 'progress'}
+                {#if $alertStore.submsg && $alertStore.type !== 'progress' && $alertStore.type !== 'progress2'}
                     <span class="text-gray-500 text-sm">{$alertStore.submsg}</span>
                 {/if}
             {/if}
@@ -121,6 +121,14 @@
                 </div>
                 <div class="w-full flex justify-center">
                     <Googli className="mt-14" />                    
+                </div>
+            {/if}
+            {#if $alertStore.type === 'progress2'}
+                <div class="w-full min-w-64 md:min-w-138 h-2 bg-darkbg border border-darkborderc rounded-md mt-6">
+                    <div class="h-full bg-gradient-to-r from-blue-500 to-purple-800 saving-animation transition-[width]"></div>
+                </div>
+                <div class="w-full flex justify-center mt-6">
+                    <span class="text-gray-500 text-sm">{$alertStore.submsg}</span>
                 </div>
             {/if}
 

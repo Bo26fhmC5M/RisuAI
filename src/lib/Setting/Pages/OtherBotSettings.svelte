@@ -749,9 +749,6 @@
                 <span class="text-textcolor">{language.hypaV3Settings.randomMemoryRatioLabel}</span>
                 <NumberInput marginBottom disabled size="sm" value={parseFloat((1 - settings.recentMemoryRatio - settings.similarMemoryRatio).toFixed(2))} />
                 <div class="mb-2">
-                    <Check name={language.hypaV3Settings.enableSimilarityCorrectionLabel} bind:check={settings.enableSimilarityCorrection} />
-                </div>
-                <div class="mb-2">
                     <Check name={language.hypaV3Settings.preserveOrphanedMemoryLabel} bind:check={settings.preserveOrphanedMemory} />
                 </div>
                 <div class="mb-2">
@@ -760,9 +757,28 @@
                 <div class="mb-2">
                     <Check name={language.hypaV3Settings.doNotSummarizeUserMessageLabel} bind:check={settings.doNotSummarizeUserMessage} />
                 </div>
+                <Arcodion name="Advanced Settings" styled>
+                    <div class="mb-2">
+                        <Check name="Use Experimental Implementation" bind:check={settings.useExperimentalImpl} />
+                    </div>
+                    {#if settings.useExperimentalImpl}
+                        <span class="text-textcolor">Summarization Requests Per Minute</span>
+                        <NumberInput marginBottom size="sm" min={1} bind:value={settings.summarizationRequestsPerMinute} />
+                        <span class="text-textcolor">Summarization Max Concurrent</span>
+                        <NumberInput marginBottom size="sm" min={1} max={10} bind:value={settings.summarizationMaxConcurrent} />
+                        <span class="text-textcolor">Embedding Requests Per Minute</span>
+                        <NumberInput marginBottom size="sm" min={1} bind:value={settings.embeddingRequestsPerMinute} />
+                        <span class="text-textcolor">Embedding Max Concurrent</span>
+                        <NumberInput marginBottom size="sm" min={1} max={10} bind:value={settings.embeddingMaxConcurrent} />
+                    {:else}
+                        <div class="mb-2">
+                            <Check name={language.hypaV3Settings.enableSimilarityCorrectionLabel} bind:check={settings.enableSimilarityCorrection} />
+                        </div>
+                    {/if}
+                </Arcodion>
             {/if}
 
-            <div class="mb-4"></div>
+            <div class="mb-8"></div>
         {:else if (DBState.db.supaModelType !== 'none' && DBState.db.hypav2 === false && DBState.db.hypaV3 === false)}
             <span class="mb-2 text-textcolor2 text-sm text-wrap break-words max-w-full">{language.supaDesc}</span>
             <span class="text-textcolor mt-4">{language.SuperMemory} {language.model}</span>
